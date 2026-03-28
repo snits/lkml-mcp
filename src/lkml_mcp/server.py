@@ -12,9 +12,11 @@ from mcp.types import TextContent, Tool
 
 from .client import LKMLAPIError, LKMLClient
 from .handlers import (
+    handle_lkml_compare_patch_versions,
     handle_lkml_get_patch,
     handle_lkml_get_raw,
     handle_lkml_get_thread,
+    handle_lkml_get_thread_summary,
     handle_lkml_get_user_series,
     handle_lkml_search_patches,
 )
@@ -182,6 +184,57 @@ async def list_tools() -> List[Tool]:
                 "required": ["message_id"],
             },
         ),
+        Tool(
+            name="lkml_get_thread_summary",
+            description=(
+                "Get a structured summary of an LKML thread: reply hierarchy, "
+                "participants, and review tags (Reviewed-by, Acked-by, etc.)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Message ID of any message in the thread",
+                    },
+                    "inbox": {
+                        "type": "string",
+                        "description": "Inbox/list name (required for sourceware-style instances, optional for lore.kernel.org)",
+                    },
+                    "include_bots": {
+                        "type": "boolean",
+                        "description": "Include automated bot messages. Default false.",
+                        "default": False,
+                    },
+                },
+                "required": ["message_id"],
+            },
+        ),
+        Tool(
+            name="lkml_compare_patch_versions",
+            description=(
+                "Compare two versions of a patch series. Shows subject changes, "
+                "file differences, and new/removed patches between versions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "old_message_id": {
+                        "type": "string",
+                        "description": "Message ID of the older version's cover letter or first patch",
+                    },
+                    "new_message_id": {
+                        "type": "string",
+                        "description": "Message ID of the newer version's cover letter or first patch",
+                    },
+                    "inbox": {
+                        "type": "string",
+                        "description": "Inbox/list name (required for sourceware-style instances, optional for lore.kernel.org)",
+                    },
+                },
+                "required": ["old_message_id", "new_message_id"],
+            },
+        ),
     ]
 
 
@@ -201,6 +254,10 @@ async def call_tool(name: str, arguments: Optional[Dict[str, Any]]):
             return await handle_lkml_search_patches(client, arguments)
         elif name == "lkml_get_patch":
             return await handle_lkml_get_patch(client, arguments)
+        elif name == "lkml_get_thread_summary":
+            return await handle_lkml_get_thread_summary(client, arguments)
+        elif name == "lkml_compare_patch_versions":
+            return await handle_lkml_compare_patch_versions(client, arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

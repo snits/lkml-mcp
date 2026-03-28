@@ -118,6 +118,126 @@ def _extract_reply_context(body: str, max_lines: int = 5) -> tuple[str, str | No
     return "\n".join(result).strip(), None
 
 
+def _parse_from_field(from_field: str) -> tuple[str, str]:
+    """Extract name and email from a From header.
+
+    Args:
+        from_field: From header value (e.g., 'Lucas Zampieri <lzampier@redhat.com>')
+
+    Returns:
+        Tuple of (name, email)
+    """
+    if "<" in from_field:
+        name = from_field.split("<")[0].strip()
+        email_addr = from_field.split("<")[1].rstrip(">").strip()
+        return name, email_addr
+    return from_field.strip(), ""
+
+
+def _parse_review_tags(body: str) -> list[dict]:
+    """Extract review tags from a message body.
+
+    Scans for Reviewed-by, Acked-by, Tested-by, NAKed-by, Nacked-by,
+    and Reported-by tags.
+
+    Args:
+        body: Message body text
+
+    Returns:
+        List of dicts with type, name, and email
+    """
+    tag_pattern = re.compile(
+        r"^(Reviewed-by|Acked-by|Tested-by|(?:NAKed|Nacked)-by|Reported-by)"
+        r":\s*(.+?)\s*(?:<([^>]+)>)?\s*$",
+        re.MULTILINE,
+    )
+    tags = []
+    for match in tag_pattern.finditer(body):
+        tags.append(
+            {
+                "type": match.group(1),
+                "name": match.group(2).strip(),
+                "email": match.group(3) or "",
+            }
+        )
+    return tags
+
+
+def _parse_patch_subject(subject: str) -> dict:
+    """Extract patch metadata from a subject line.
+
+    Args:
+        subject: Email subject (e.g., '[PATCH v5 2/3] Fix foo')
+
+    Returns:
+        Dict with is_patch, version, patch_number, total
+    """
+    match = re.search(
+        r"\[(?:RFC\s+)?PATCH[^\]]*?(?:\s*v(\d+))?[^\]]*?(?:\s+(\d+)/(\d+))?\]",
+        subject,
+    )
+    if not match:
+        return {"is_patch": False, "version": None, "patch_number": None, "total": None}
+    return {
+        "is_patch": True,
+        "version": int(match.group(1)) if match.group(1) else None,
+        "patch_number": int(match.group(2)) if match.group(2) else None,
+        "total": int(match.group(3)) if match.group(3) else None,
+    }
+
+
+def _extract_patch_metadata(body: str) -> dict:
+    """Extract structured patch metadata from a message body.
+
+    Args:
+        body: Message body text
+
+    Returns:
+        Dict with commit_message, files, stats, has_diff
+    """
+    lines = body.split("\n")
+
+    has_diff = False
+    diff_start_idx = -1
+    for i, line in enumerate(lines):
+        if line.startswith("---") and i < len(lines) - 1:
+            if (
+                lines[i + 1].startswith("+++")
+                or lines[i + 1].strip() == ""
+                or re.match(r"^\s+\S+\s+\|\s+\d+", lines[i + 1])
+            ):
+                has_diff = True
+                diff_start_idx = i
+                break
+
+    if not has_diff:
+        return {
+            "commit_message": body.strip(),
+            "files": [],
+            "stats": None,
+            "has_diff": False,
+        }
+
+    commit_message = "\n".join(lines[:diff_start_idx]).strip()
+
+    stats = None
+    files = []
+    for line in lines[diff_start_idx:]:
+        if "file" in line and "changed" in line:
+            stats = line.strip()
+        if line.startswith("diff --git"):
+            match = re.search(r"b/(.+)$", line)
+            if match:
+                files.append(match.group(1))
+
+    return {
+        "commit_message": commit_message,
+        "files": files,
+        "stats": stats,
+        "has_diff": True,
+    }
+
+
 class LKMLClient:
     """Client for fetching LKML threads from lore.kernel.org or compatible archives."""
 
@@ -615,6 +735,285 @@ class LKMLClient:
             raise LKMLAPIError(f"Failed to fetch patch: {e}") from e
         except Exception as e:
             raise LKMLAPIError(f"Failed to process patch: {e}") from e
+
+    def get_thread_summary(
+        self,
+        message_id: str,
+        inbox: str | None = None,
+        include_bots: bool = False,
+    ) -> Dict[str, Any]:
+        """Get a structured summary of a thread with reply hierarchy and review tags.
+
+        Args:
+            message_id: The message ID of any message in the thread
+            inbox: Inbox/list name (required for sourceware-style instances)
+            include_bots: If True, include bot messages
+
+        Returns:
+            Dictionary with thread summary including reply tree, participants, and tags
+        """
+        message_id = message_id.strip("<>")
+
+        try:
+            raw_messages = self._fetch_mbox(message_id, inbox)
+            parsed = []
+
+            for raw_msg in raw_messages:
+                if not raw_msg.strip():
+                    continue
+                msg = email.message_from_string(raw_msg)
+
+                from_field = msg.get("from", "")
+                if not include_bots and _is_bot_message(from_field):
+                    continue
+
+                body = self._decode_payload(msg)
+                msg_id = msg.get("message-id", "").strip("<>")
+                subject = msg.get("subject", "")
+                in_reply_to = msg.get("in-reply-to", "").strip("<>")
+                date = msg.get("date", "")
+                name, email_addr = _parse_from_field(from_field)
+                tags = _parse_review_tags(body)
+                patch_info = _parse_patch_subject(subject)
+
+                parsed.append(
+                    {
+                        "message_id": msg_id,
+                        "subject": subject,
+                        "from": from_field,
+                        "from_name": name,
+                        "from_email": email_addr,
+                        "date": date,
+                        "in_reply_to": in_reply_to,
+                        "tags": tags,
+                        "is_patch": patch_info["is_patch"]
+                        and not re.match(r"^Re:\s*", subject, flags=re.IGNORECASE),
+                    }
+                )
+
+            # Build reply tree
+            by_id = {m["message_id"]: m for m in parsed}
+            children: Dict[str, list] = {}
+            roots = []
+
+            for m in parsed:
+                parent_id = m["in_reply_to"]
+                if parent_id and parent_id in by_id:
+                    children.setdefault(parent_id, []).append(m)
+                else:
+                    roots.append(m)
+
+            # DFS to assign depth and build ordered list
+            ordered = []
+            visited = set()
+
+            def dfs(node, depth):
+                if node["message_id"] in visited:
+                    return
+                visited.add(node["message_id"])
+                node["depth"] = depth
+                ordered.append(node)
+                for child in children.get(node["message_id"], []):
+                    dfs(child, depth + 1)
+
+            for root in roots:
+                dfs(root, 0)
+
+            # Add any unvisited messages (orphans)
+            for m in parsed:
+                if m["message_id"] not in visited:
+                    m["depth"] = 0
+                    ordered.append(m)
+
+            # Aggregate participants
+            participant_counts: Dict[tuple, int] = {}
+            for m in parsed:
+                key = (m["from_name"], m["from_email"])
+                participant_counts[key] = participant_counts.get(key, 0) + 1
+
+            participants = [
+                {"name": name, "email": email_addr, "count": count}
+                for (name, email_addr), count in sorted(
+                    participant_counts.items(), key=lambda x: -x[1]
+                )
+            ]
+
+            # Aggregate tags with source message
+            all_tags = []
+            for m in parsed:
+                for tag in m["tags"]:
+                    all_tags.append({**tag, "in_message": m["message_id"]})
+
+            # Thread root info
+            root = ordered[0] if ordered else {}
+
+            # Build clean message list for output
+            messages = [
+                {
+                    "message_id": m["message_id"],
+                    "subject": m["subject"],
+                    "from": m["from"],
+                    "date": m["date"],
+                    "depth": m["depth"],
+                    "tags": m["tags"],
+                    "is_patch": m["is_patch"],
+                }
+                for m in ordered
+            ]
+
+            return {
+                "message_id": message_id,
+                "subject": root.get("subject", ""),
+                "author": root.get("from", ""),
+                "date": root.get("date", ""),
+                "total_messages": len(parsed),
+                "participants": participants,
+                "tags": all_tags,
+                "messages": messages,
+            }
+
+        except ValueError:
+            raise
+        except requests.exceptions.RequestException as e:
+            raise LKMLAPIError(f"Failed to fetch thread: {e}") from e
+        except Exception as e:
+            raise LKMLAPIError(f"Failed to build thread summary: {e}") from e
+
+    def compare_patch_versions(
+        self,
+        old_message_id: str,
+        new_message_id: str,
+        inbox: str | None = None,
+    ) -> Dict[str, Any]:
+        """Compare two versions of a patch series.
+
+        Args:
+            old_message_id: Message ID of the older version's cover letter or first patch
+            new_message_id: Message ID of the newer version's cover letter or first patch
+            inbox: Inbox/list name (required for sourceware-style instances)
+
+        Returns:
+            Dictionary with version comparison showing changes, additions, and removals
+        """
+        old_message_id = old_message_id.strip("<>")
+        new_message_id = new_message_id.strip("<>")
+
+        try:
+            old_raw = self._fetch_mbox(old_message_id, inbox)
+            new_raw = self._fetch_mbox(new_message_id, inbox)
+
+            def parse_patches(raw_messages):
+                patches = []
+                version = None
+                for raw_msg in raw_messages:
+                    if not raw_msg.strip():
+                        continue
+                    msg = email.message_from_string(raw_msg)
+                    subject = msg.get("subject", "")
+                    from_field = msg.get("from", "")
+
+                    if re.match(r"^Re:\s*", subject, flags=re.IGNORECASE):
+                        continue
+                    if _is_bot_message(from_field):
+                        continue
+                    if "[PATCH" not in subject:
+                        continue
+
+                    body = self._decode_payload(msg)
+                    patch_info = _parse_patch_subject(subject)
+                    metadata = _extract_patch_metadata(body)
+
+                    if patch_info["version"] and version is None:
+                        version = patch_info["version"]
+
+                    patches.append(
+                        {
+                            "patch_number": patch_info["patch_number"],
+                            "subject": subject,
+                            "title": re.sub(
+                                r"\[(?:RFC\s+)?PATCH[^\]]*\]\s*", "", subject
+                            ),
+                            "files": metadata["files"],
+                            "stats": metadata["stats"],
+                        }
+                    )
+
+                patches.sort(key=lambda p: p["patch_number"] or 0)
+                return patches, version
+
+            old_patches, old_version = parse_patches(old_raw)
+            new_patches, new_version = parse_patches(new_raw)
+
+            # Build lookup by patch number (exclude cover letters)
+            old_by_num = {
+                p["patch_number"]: p for p in old_patches if p["patch_number"]
+            }
+            new_by_num = {
+                p["patch_number"]: p for p in new_patches if p["patch_number"]
+            }
+
+            all_nums = sorted(set(old_by_num.keys()) | set(new_by_num.keys()))
+
+            changes = []
+            patches_added = []
+            patches_removed = []
+
+            for num in all_nums:
+                old_p = old_by_num.get(num)
+                new_p = new_by_num.get(num)
+
+                if old_p and new_p:
+                    old_files = set(old_p["files"])
+                    new_files = set(new_p["files"])
+                    changes.append(
+                        {
+                            "patch_number": num,
+                            "old_subject": old_p["subject"],
+                            "new_subject": new_p["subject"],
+                            "subject_changed": old_p["title"] != new_p["title"],
+                            "old_files": old_p["files"],
+                            "new_files": new_p["files"],
+                            "files_added": sorted(new_files - old_files),
+                            "files_removed": sorted(old_files - new_files),
+                            "old_stats": old_p["stats"],
+                            "new_stats": new_p["stats"],
+                        }
+                    )
+                elif new_p:
+                    patches_added.append(
+                        {"patch_number": num, "subject": new_p["subject"]}
+                    )
+                elif old_p:
+                    patches_removed.append(
+                        {"patch_number": num, "subject": old_p["subject"]}
+                    )
+
+            return {
+                "old_version": {
+                    "message_id": old_message_id,
+                    "version": f"v{old_version}" if old_version else "v1",
+                    "patch_count": len(
+                        [p for p in old_patches if p["patch_number"]]
+                    ),
+                },
+                "new_version": {
+                    "message_id": new_message_id,
+                    "version": f"v{new_version}" if new_version else "v1",
+                    "patch_count": len(
+                        [p for p in new_patches if p["patch_number"]]
+                    ),
+                },
+                "changes": changes,
+                "patches_added": patches_added,
+                "patches_removed": patches_removed,
+            }
+
+        except ValueError:
+            raise
+        except requests.exceptions.RequestException as e:
+            raise LKMLAPIError(f"Failed to fetch patches: {e}") from e
+        except Exception as e:
+            raise LKMLAPIError(f"Failed to compare versions: {e}") from e
 
     def get_user_series(
         self, email: str, inbox: str | None = None, max_results: int = 50
