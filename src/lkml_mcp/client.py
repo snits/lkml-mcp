@@ -6,6 +6,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict
+from urllib.parse import quote_plus
 
 import requests
 
@@ -172,6 +173,222 @@ class LKMLClient:
             )
         return f"{self.BASE_URL}/{inbox}/{message_id}/{suffix}"
 
+    def _resolve_search_path(self, inbox: str | None) -> str:
+        """Resolve the search path based on instance capabilities.
+
+        Args:
+            inbox: Optional inbox name
+
+        Returns:
+            Search path string ('all' for universal redirect, or inbox name)
+
+        Raises:
+            ValueError: If inbox is required but not provided
+        """
+        if self._supports_universal_redirect:
+            return "all"
+        if not inbox:
+            raise ValueError(
+                f"inbox parameter is required for {self.BASE_URL}. "
+                f"Please specify which mailing list/inbox to search. "
+                f"Examples for sourceware: 'gcc', 'gcc-patches', 'libc-alpha', 'gdb-patches'"
+            )
+        return inbox
+
+    @staticmethod
+    def _split_mbox(mbox_text: str) -> list[str]:
+        """Split mbox text into individual raw messages.
+
+        Args:
+            mbox_text: Raw mbox text content
+
+        Returns:
+            List of raw message strings
+        """
+        raw_messages = []
+        current_message = []
+        for line in mbox_text.split("\n"):
+            if line.startswith("From ") and current_message:
+                raw_messages.append("\n".join(current_message))
+                current_message = []
+            else:
+                current_message.append(line)
+        if current_message:
+            raw_messages.append("\n".join(current_message))
+        return raw_messages
+
+    def _fetch_mbox(self, message_id: str, inbox: str | None) -> list[str]:
+        """Fetch and split an mbox archive for a message thread.
+
+        Args:
+            message_id: The message ID (without angle brackets)
+            inbox: Optional inbox name
+
+        Returns:
+            List of raw message strings from the mbox
+        """
+        url = self._build_url(message_id, inbox, "t.mbox.gz")
+        response = self.session.get(url, timeout=self.timeout)
+        response.raise_for_status()
+        mbox_data = gzip.decompress(response.content)
+        return self._split_mbox(mbox_data.decode("utf-8", errors="ignore"))
+
+    @staticmethod
+    def _decode_payload(msg) -> str:
+        """Decode email message payload with charset detection.
+
+        Args:
+            msg: An email.message.Message object
+
+        Returns:
+            Decoded body text
+        """
+        if msg.is_multipart():
+            body = ""
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        body += payload.decode(charset, errors="ignore")
+            return body
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="ignore")
+        return ""
+
+    def _parse_atom_entries(self, base_url: str, max_results: int) -> list[dict]:
+        """Parse paginated Atom feed entries.
+
+        Args:
+            base_url: Base URL for the Atom feed query
+            max_results: Maximum number of entries to return
+
+        Returns:
+            List of dicts with message_id, title, updated, author, url
+        """
+        all_entries = []
+        page_size = 200
+        offset = 0
+
+        while len(all_entries) < max_results:
+            url = base_url if offset == 0 else f"{base_url}&o={offset}"
+            response = self.session.get(url, timeout=self.timeout)
+            response.raise_for_status()
+
+            root = ET.fromstring(response.content)
+            ns = {
+                "atom": "http://www.w3.org/2005/Atom",
+                "thr": "http://purl.org/syndication/thread/1.0",
+            }
+
+            entries_in_page = root.findall("atom:entry", ns)
+            if not entries_in_page:
+                break
+
+            for entry in entries_in_page:
+                if len(all_entries) >= max_results:
+                    break
+                title_elem = entry.find("atom:title", ns)
+                link_elem = entry.find("atom:link", ns)
+                updated_elem = entry.find("atom:updated", ns)
+                author_elem = entry.find("atom:author/atom:name", ns)
+
+                href = link_elem.get("href") if link_elem is not None else ""
+                msg_id = ""
+                if href:
+                    match = re.search(r"/([^/]+)/?$", href.rstrip("/"))
+                    if match:
+                        msg_id = match.group(1)
+
+                all_entries.append(
+                    {
+                        "message_id": msg_id,
+                        "title": title_elem.text if title_elem is not None else "",
+                        "updated": updated_elem.text if updated_elem is not None else "",
+                        "author": author_elem.text if author_elem is not None else "",
+                        "url": href,
+                    }
+                )
+
+            if len(entries_in_page) < page_size:
+                break
+            offset += page_size
+
+        return all_entries
+
+    @staticmethod
+    def _clean_message(msg_text: str) -> str:
+        """Strip transport headers from an mbox message for git am.
+
+        Parses the raw message and reconstructs it with only the headers
+        that git am needs (From, Subject, Date, Message-ID, In-Reply-To,
+        References, MIME-Version, Content-Type, Content-Transfer-Encoding).
+        Strips all transport headers (Received, DKIM, ARC, etc.) and
+        mbox envelope lines.
+
+        Args:
+            msg_text: Raw mbox message text
+
+        Returns:
+            Cleaned mbox message text suitable for git am
+        """
+        msg = email.message_from_string(msg_text)
+
+        # Headers git am needs
+        keep_headers = [
+            "From", "To", "Cc", "Subject", "Date", "Message-ID",
+            "In-Reply-To", "References", "MIME-Version",
+            "Content-Type", "Content-Transfer-Encoding",
+        ]
+
+        # Build clean header block
+        header_lines = []
+        for hdr in keep_headers:
+            value = msg.get(hdr)
+            if value:
+                header_lines.append(f"{hdr}: {value}")
+
+        # Get raw body (undecoded, preserving original encoding)
+        payload = msg.get_payload(decode=False)
+        if isinstance(payload, list):
+            # Multipart - fall back to string representation
+            body = msg.as_string().split("\n\n", 1)[1] if "\n\n" in msg.as_string() else ""
+        elif isinstance(payload, bytes):
+            body = payload.decode("utf-8", errors="ignore")
+        else:
+            body = payload or ""
+
+        # Un-escape >From lines in body
+        body_lines = []
+        for line in body.split("\n"):
+            if line.startswith(">From"):
+                body_lines.append(line[1:])
+            else:
+                body_lines.append(line)
+        body = "\n".join(body_lines)
+
+        return "\n".join(header_lines) + "\n\n" + body
+
+    @staticmethod
+    def _save_patch(msg_id: str, content: str, patch_dir: str) -> str:
+        """Save a clean patch mbox to disk.
+
+        Args:
+            msg_id: Message ID (used for filename)
+            content: Clean mbox content
+            patch_dir: Directory to save to
+
+        Returns:
+            Path to saved file
+        """
+        safe_id = msg_id.replace("/", "_").replace("@", "_at_")
+        path = os.path.join(patch_dir, f"{safe_id}.mbox")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
     def get_thread(
         self, message_id: str, inbox: str | None = None, include_bots: bool = False
     ) -> Dict[str, Any]:
@@ -189,26 +406,10 @@ class LKMLClient:
             ValueError: If inbox is required but not provided
         """
         message_id = message_id.strip("<>")
-        url = self._build_url(message_id, inbox, "t.mbox.gz")
 
         try:
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-
-            mbox_data = gzip.decompress(response.content)
+            raw_messages = self._fetch_mbox(message_id, inbox)
             messages = []
-            mbox_text = mbox_data.decode("utf-8", errors="ignore")
-
-            raw_messages = []
-            current_message = []
-            for line in mbox_text.split("\n"):
-                if line.startswith("From ") and current_message:
-                    raw_messages.append("\n".join(current_message))
-                    current_message = []
-                else:
-                    current_message.append(line)
-            if current_message:
-                raw_messages.append("\n".join(current_message))
 
             diff_dir = "/tmp/lkml-mcp"
             os.makedirs(diff_dir, exist_ok=True)
@@ -218,17 +419,7 @@ class LKMLClient:
                     continue
                 msg = email.message_from_string(raw_msg)
 
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
-                            payload = part.get_payload(decode=True)
-                            if payload:
-                                body += payload.decode(errors="ignore")
-                else:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        body = payload.decode(errors="ignore")
+                body = self._decode_payload(msg)
 
                 from_field = msg.get("from", "")
                 if not include_bots and _is_bot_message(from_field):
@@ -260,6 +451,8 @@ class LKMLClient:
 
             return {"message_id": message_id, "messages": messages}
 
+        except ValueError:
+            raise
         except requests.exceptions.RequestException as e:
             raise LKMLAPIError(f"Failed to fetch thread: {e}") from e
         except Exception as e:
@@ -290,6 +483,139 @@ class LKMLClient:
         except requests.exceptions.RequestException as e:
             raise LKMLAPIError(f"Failed to fetch raw message: {e}") from e
 
+    def _get_patch_series(
+        self, message_id: str, inbox: str | None = None
+    ) -> list[tuple[str, str, str]]:
+        """Fetch all patches in a series from the thread mbox.
+
+        Uses the thread mbox to discover all patches, filtering out
+        replies and bot messages.
+
+        Args:
+            message_id: Message ID of any patch in the series
+            inbox: Optional inbox name
+
+        Returns:
+            List of (message_id, subject, cleaned_mbox_content) tuples,
+            sorted by patch number
+        """
+        raw_messages = self._fetch_mbox(message_id, inbox)
+        patches = []
+
+        for raw_msg in raw_messages:
+            if not raw_msg.strip():
+                continue
+            msg = email.message_from_string(raw_msg)
+
+            subject = msg.get("subject", "")
+            from_field = msg.get("from", "")
+            msg_id = msg.get("message-id", "").strip("<>")
+
+            # Skip replies (non-patch messages)
+            if re.match(r"^Re:\s*", subject, flags=re.IGNORECASE):
+                continue
+
+            # Skip bot messages
+            if _is_bot_message(from_field):
+                continue
+
+            # Only include messages that look like patches
+            if "[PATCH" not in subject:
+                continue
+
+            cleaned = self._clean_message(raw_msg)
+            patches.append((msg_id, subject, cleaned))
+
+        # Sort by message ID to preserve patch order
+        patches.sort(key=lambda p: p[0])
+        return patches
+
+    def get_patch(
+        self,
+        message_id: str,
+        inbox: str | None = None,
+        include_bots: bool = False,
+        series: bool = False,
+    ) -> Dict[str, Any]:
+        """Fetch patches in git am-ready mbox format.
+
+        Can fetch a single patch or discover and fetch all patches in a series.
+        Returns file paths to clean mbox files suitable for piping to 'git am'.
+
+        Args:
+            message_id: Message ID of the patch
+            inbox: Inbox/list name (required for sourceware-style instances)
+            include_bots: If True, include bot messages. Default False.
+            series: If True, fetch all patches in the series. Default False.
+
+        Returns:
+            Dictionary with message_id, series flag, and list of patch info dicts
+
+        Raises:
+            ValueError: If inbox is required but not provided
+        """
+        message_id = message_id.strip("<>")
+        patch_dir = "/tmp/lkml-mcp"
+        os.makedirs(patch_dir, exist_ok=True)
+
+        try:
+            if series:
+                patch_tuples = self._get_patch_series(message_id, inbox)
+                patches = []
+                for msg_id, subject, content in patch_tuples:
+                    path = self._save_patch(msg_id, content, patch_dir)
+                    patches.append(
+                        {
+                            "message_id": msg_id,
+                            "subject": subject,
+                            "path": path,
+                        }
+                    )
+            else:
+                # Single patch mode
+                raw_messages = self._fetch_mbox(message_id, inbox)
+                patches = []
+
+                for raw_msg in raw_messages:
+                    if not raw_msg.strip():
+                        continue
+                    msg = email.message_from_string(raw_msg)
+
+                    subject = msg.get("subject", "")
+                    from_field = msg.get("from", "")
+                    msg_id = msg.get("message-id", "").strip("<>")
+
+                    # Skip replies
+                    if re.match(r"^Re:\s*", subject, flags=re.IGNORECASE):
+                        continue
+
+                    # Skip bots unless requested
+                    if not include_bots and _is_bot_message(from_field):
+                        continue
+
+                    cleaned = self._clean_message(raw_msg)
+                    path = self._save_patch(msg_id, cleaned, patch_dir)
+                    patches.append(
+                        {
+                            "message_id": msg_id,
+                            "subject": subject,
+                            "path": path,
+                        }
+                    )
+                    # In single mode, only save the first actual patch
+                    break
+
+            return {
+                "message_id": message_id,
+                "series": series,
+                "patches": patches,
+            }
+
+        except requests.exceptions.RequestException as e:
+            raise LKMLAPIError(f"Failed to fetch patch: {e}") from e
+        except Exception as e:
+            raise LKMLAPIError(f"Failed to process patch: {e}") from e
+
     def get_user_series(
         self, email: str, inbox: str | None = None, max_results: int = 50
     ) -> Dict[str, Any]:
@@ -303,54 +629,13 @@ class LKMLClient:
         Returns:
             Dictionary containing list of series with their root message IDs
         """
-        # For search, use /all/ if supported, otherwise require inbox
-        if self._supports_universal_redirect:
-            search_path = "all"
-        else:
-            if not inbox:
-                raise ValueError(
-                    f"inbox parameter is required for {self.BASE_URL}. "
-                    f"Please specify which mailing list/inbox to search. "
-                    f"Examples for sourceware: 'gcc', 'gcc-patches', 'libc-alpha', 'gdb-patches'"
-                )
-            search_path = inbox
+        search_path = self._resolve_search_path(inbox)
 
-        url = f"{self.BASE_URL}/{search_path}/?q=f:{email}&x=A"
+        encoded_query = quote_plus(f"f:{email}")
+        base_url = f"{self.BASE_URL}/{search_path}/?q={encoded_query}&x=A"
 
         try:
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-
-            root = ET.fromstring(response.content)
-            ns = {
-                "atom": "http://www.w3.org/2005/Atom",
-                "thr": "http://purl.org/syndication/thread/1.0",
-            }
-
-            all_entries = []
-            for entry in root.findall("atom:entry", ns)[:max_results]:
-                title_elem = entry.find("atom:title", ns)
-                link_elem = entry.find("atom:link", ns)
-                updated_elem = entry.find("atom:updated", ns)
-
-                href = link_elem.get("href") if link_elem is not None else ""
-                msg_id = ""
-                if href:
-                    match = re.search(r"/([^/]+)/?$", href.rstrip("/"))
-                    if match:
-                        msg_id = match.group(1)
-
-                title = title_elem.text if title_elem is not None else ""
-                updated = updated_elem.text if updated_elem is not None else ""
-
-                all_entries.append(
-                    {
-                        "message_id": msg_id,
-                        "title": title,
-                        "updated": updated,
-                        "url": href,
-                    }
-                )
+            all_entries = self._parse_atom_entries(base_url, max_results)
 
             filtered_entries = []
             for entry in all_entries:
@@ -486,17 +771,7 @@ class LKMLClient:
         Returns:
             Dictionary containing list of matching patches
         """
-        # For search, use /all/ if supported, otherwise require inbox
-        if self._supports_universal_redirect:
-            search_path = "all"
-        else:
-            if not inbox:
-                raise ValueError(
-                    f"inbox parameter is required for {self.BASE_URL}. "
-                    f"Please specify which mailing list/inbox to search. "
-                    f"Examples for sourceware: 'gcc', 'gcc-patches', 'libc-alpha', 'gdb-patches'"
-                )
-            search_path = inbox
+        search_path = self._resolve_search_path(inbox)
 
         search_terms = [query]
 
@@ -505,39 +780,20 @@ class LKMLClient:
         if author:
             search_terms.append(f"f:{author}")
         if since_date:
-            search_terms.append(f"dt:{since_date}..")
+            # Format as YYYY-MM-DD for Xapian date filter
+            formatted_date = f"{since_date[:4]}-{since_date[4:6]}-{since_date[6:8]}"
+            search_terms.append(f"d:{formatted_date}..")
 
         search_query = " ".join(search_terms)
-        url = f"{self.BASE_URL}/{search_path}/?q={search_query}&x=A"
+        encoded_query = quote_plus(search_query)
+        base_url = f"{self.BASE_URL}/{search_path}/?q={encoded_query}&x=A"
 
         try:
-            response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-
-            root = ET.fromstring(response.content)
-            ns = {
-                "atom": "http://www.w3.org/2005/Atom",
-                "thr": "http://purl.org/syndication/thread/1.0",
-            }
+            raw_entries = self._parse_atom_entries(base_url, max_results)
 
             results = []
-            for entry in root.findall("atom:entry", ns)[:max_results]:
-                title_elem = entry.find("atom:title", ns)
-                link_elem = entry.find("atom:link", ns)
-                updated_elem = entry.find("atom:updated", ns)
-                author_elem = entry.find("atom:author/atom:name", ns)
-
-                href = link_elem.get("href") if link_elem is not None else ""
-                msg_id = ""
-                if href:
-                    match = re.search(r"/([^/]+)/?$", href.rstrip("/"))
-                    if match:
-                        msg_id = match.group(1)
-
-                title = title_elem.text if title_elem is not None else ""
-                updated = updated_elem.text if updated_elem is not None else ""
-                author_name = author_elem.text if author_elem is not None else ""
-
+            for entry in raw_entries:
+                title = entry["title"]
                 is_patch = "[PATCH" in title
                 patch_info = {}
 
@@ -557,11 +813,11 @@ class LKMLClient:
 
                 results.append(
                     {
-                        "message_id": msg_id,
+                        "message_id": entry["message_id"],
                         "title": title,
-                        "author": author_name,
-                        "updated": updated,
-                        "url": href,
+                        "author": entry["author"],
+                        "updated": entry["updated"],
+                        "url": entry["url"],
                         "is_patch": is_patch,
                         "patch_info": patch_info if is_patch else None,
                     }

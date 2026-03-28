@@ -12,6 +12,7 @@ from mcp.types import TextContent, Tool
 
 from .client import LKMLAPIError, LKMLClient
 from .handlers import (
+    handle_lkml_get_patch,
     handle_lkml_get_raw,
     handle_lkml_get_thread,
     handle_lkml_get_user_series,
@@ -149,6 +150,38 @@ async def list_tools() -> List[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="lkml_get_patch",
+            description=(
+                "Fetch patches from lore.kernel.org in git am-ready mbox format. "
+                "Can fetch a single patch or all patches in a series. "
+                "Returns file paths to clean mbox files suitable for 'git am'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Message ID of the patch (e.g., '20251111105634.1684751-1-lzampier@redhat.com')",
+                    },
+                    "inbox": {
+                        "type": "string",
+                        "description": "Inbox/list name (required for sourceware-style instances, optional for lore.kernel.org)",
+                    },
+                    "include_bots": {
+                        "type": "boolean",
+                        "description": "Include automated bot messages. Default false.",
+                        "default": False,
+                    },
+                    "series": {
+                        "type": "boolean",
+                        "description": "If true, fetch all patches in the series. If false, fetch only this single patch.",
+                        "default": False,
+                    },
+                },
+                "required": ["message_id"],
+            },
+        ),
     ]
 
 
@@ -166,6 +199,8 @@ async def call_tool(name: str, arguments: Optional[Dict[str, Any]]):
             return await handle_lkml_get_user_series(client, arguments)
         elif name == "lkml_search_patches":
             return await handle_lkml_search_patches(client, arguments)
+        elif name == "lkml_get_patch":
+            return await handle_lkml_get_patch(client, arguments)
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

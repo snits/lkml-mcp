@@ -100,6 +100,36 @@ async def handle_lkml_get_user_series(client: LKMLClient, arguments: Dict[str, A
     return [TextContent(type="text", text="\n".join(lines))]
 
 
+async def handle_lkml_get_patch(client: LKMLClient, arguments: Dict[str, Any]) -> List[TextContent]:
+    """Handle lkml_get_patch tool call."""
+    message_id = arguments.get("message_id")
+    if not message_id:
+        raise ValueError("message_id is required")
+
+    inbox = arguments.get("inbox")
+    include_bots = arguments.get("include_bots", False)
+    series = arguments.get("series", False)
+
+    result = client.get_patch(message_id, inbox=inbox, include_bots=include_bots, series=series)
+
+    lines = [
+        f"Patches for: {result['message_id']}",
+        f"Series mode: {result['series']}",
+        f"Patches saved: {len(result['patches'])}",
+        "",
+        "Files are git am-ready. Apply with: git am <path>",
+        "",
+    ]
+
+    for i, patch in enumerate(result["patches"], 1):
+        lines.append(f"[{i}] {patch['subject']}")
+        lines.append(f"    Message ID: {patch['message_id']}")
+        lines.append(f"    Path: {patch['path']}")
+        lines.append("")
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 async def handle_lkml_search_patches(client: LKMLClient, arguments: Dict[str, Any]) -> List[TextContent]:
     """Handle lkml_search_patches tool call."""
     query = arguments.get("query")
