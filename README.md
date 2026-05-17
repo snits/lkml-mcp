@@ -184,6 +184,35 @@ export LKML_BASE_URL="https://custom-lore-instance.org"
 python -m lkml_mcp.server
 ```
 
+### Transport (stdio / SSE / Streamable HTTP)
+
+The server runs on stdio by default and can also be exposed over HTTP so multiple clients share one process.
+
+CLI flags:
+- `--transport {stdio,sse,streamable-http}` (default `stdio`)
+- `--host` (default `0.0.0.0`)
+- `--port` (default `8772`)
+
+Environment overrides: `LKML_MCP_TRANSPORT`, `LKML_MCP_HOST`, `LKML_MCP_PORT`.
+
+Run as a daemon:
+```bash
+lkml-mcp --transport streamable-http --host 0.0.0.0 --port 8772
+# or
+lkml-mcp --transport sse --host 0.0.0.0 --port 8772
+```
+
+Client endpoints:
+- Streamable HTTP: `http://<host>:8772/mcp`
+- SSE: `http://<host>:8772/sse` (with POSTs to `/messages/`)
+
+Add the running daemon to Claude Code:
+```bash
+claude mcp add -s user -t http lkml http://127.0.0.1:8772/mcp
+# or for SSE:
+claude mcp add -s user -t sse lkml http://127.0.0.1:8772/sse
+```
+
 ### Multi-Instance Setup
 
 You can configure multiple MCP server instances to access different public-inbox archives simultaneously. This is useful for accessing both Linux kernel mailing lists (lore.kernel.org) and other projects (like GCC, Glibc on inbox.sourceware.org).

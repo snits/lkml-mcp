@@ -1,6 +1,8 @@
 """MCP server for LKML thread retrieval."""
 
+import argparse
 import asyncio
+import contextlib
 import os
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +22,11 @@ from .handlers import (
     handle_lkml_get_user_series,
     handle_lkml_search_patches,
 )
+
+DEFAULT_TRANSPORT = "stdio"
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8772
+VALID_TRANSPORTS = ("stdio", "sse", "streamable-http")
 
 server = Server("lkml-mcp")
 base_url = os.environ.get("LKML_BASE_URL", "https://lore.kernel.org")
@@ -267,26 +274,106 @@ async def call_tool(name: str, arguments: Optional[Dict[str, Any]]):
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
-async def main():
-    """Run the MCP server."""
+def _init_options() -> InitializationOptions:
+    return InitializationOptions(
+        server_name="lkml-mcp",
+        server_version="0.1.0",
+        capabilities=server.get_capabilities(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        ),
+    )
+
+
+async def run_stdio() -> None:
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="lkml-mcp",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
+        await server.run(read_stream, write_stream, _init_options())
+
+
+def run_sse(host: str, port: int) -> None:
+    import uvicorn
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Mount, Route
+
+    sse = SseServerTransport("/messages/")
+
+    async def handle_sse(request):
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await server.run(streams[0], streams[1], _init_options())
+        return Response()
+
+    app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse, methods=["GET"]),
+            Mount("/messages/", app=sse.handle_post_message),
+        ]
+    )
+    uvicorn.run(app, host=host, port=port)
+
+
+def run_streamable_http(host: str, port: int) -> None:
+    import uvicorn
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    session_manager = StreamableHTTPSessionManager(app=server)
+
+    async def handle_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        async with session_manager.run():
+            yield
+
+    app = Starlette(
+        routes=[Mount("/mcp", app=handle_mcp)],
+        lifespan=lifespan,
+    )
+    uvicorn.run(app, host=host, port=port)
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="lkml-mcp", description="MCP server for LKML thread retrieval")
+    parser.add_argument(
+        "--transport",
+        choices=VALID_TRANSPORTS,
+        default=os.environ.get("LKML_MCP_TRANSPORT", DEFAULT_TRANSPORT),
+        help="Transport to use (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("LKML_MCP_HOST", DEFAULT_HOST),
+        help="Bind host for sse/streamable-http (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("LKML_MCP_PORT", DEFAULT_PORT)),
+        help="Bind port for sse/streamable-http (default: 8772)",
+    )
+    return parser.parse_args(argv)
 
 
 def asyncio_main() -> None:
     """Entry point for console scripts."""
-    asyncio.run(main())
+    args = _parse_args()
+    if args.transport == "stdio":
+        asyncio.run(run_stdio())
+    elif args.transport == "sse":
+        run_sse(args.host, args.port)
+    elif args.transport == "streamable-http":
+        run_streamable_http(args.host, args.port)
+    else:
+        raise SystemExit(f"Unknown transport: {args.transport}")
+
+
+async def main():
+    """Legacy stdio entry kept for backwards compatibility."""
+    await run_stdio()
 
 
 if __name__ == "__main__":
