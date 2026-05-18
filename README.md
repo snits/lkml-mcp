@@ -8,6 +8,9 @@ A Model Context Protocol (MCP) server for accessing Linux Kernel Mailing List th
 - **lkml_get_raw**: Fetch a single message in raw RFC822 format, useful for getting raw MIME bodies, headers, or inline diffs
 - **lkml_get_user_series**: Find recent patch series and messages by user email address. Returns a list of patch series with cover letters and patches grouped together, plus standalone messages
 - **lkml_search_patches**: Search for patches by keywords, subsystem, author, or other criteria. Returns matching patch series and individual patches
+- **lkml_get_patch**: Fetch patches in git am-ready mbox format. Can fetch a single patch or an entire series
+- **lkml_get_thread_summary**: Get a structured summary of a thread: reply hierarchy, participants, and review tags (Reviewed-by, Acked-by, etc.)
+- **lkml_compare_patch_versions**: Compare two versions of a patch series, showing subject changes, file differences, and new/removed patches
 - **Cross-mailing-list support**: Works with any mailing list on lore.kernel.org without hardcoding list names (lkml, linux-riscv, netdev, devicetree, etc.)
 
 ## Usage Examples
@@ -65,6 +68,28 @@ since kvm_read_guest() can return 0 for a partial read.
 - **Parameters**:
   - `message_id` (string) - The message ID to fetch (e.g., '20251111105634.1684751-1-lzampier@redhat.com'). Can be provided with or without angle brackets.
 - **Returns**: Raw RFC822 formatted message including all headers and MIME content
+
+### lkml_get_patch
+- **Parameters**:
+  - `message_id` (string, required) - Message ID of the patch
+  - `inbox` (string, optional) - Inbox/list name (required for sourceware-style instances)
+  - `series` (boolean, optional, default false) - If true, fetch all patches in the series; if false, fetch only this patch
+  - `include_bots` (boolean, optional, default false) - Include automated bot messages
+- **Returns**: File paths to clean mbox files suitable for `git am`
+
+### lkml_get_thread_summary
+- **Parameters**:
+  - `message_id` (string, required) - Message ID of any message in the thread
+  - `inbox` (string, optional) - Inbox/list name (required for sourceware-style instances)
+  - `include_bots` (boolean, optional, default false) - Include automated bot messages
+- **Returns**: Structured summary with reply hierarchy, participant list, and review tags (Reviewed-by, Acked-by, Tested-by, etc.)
+
+### lkml_compare_patch_versions
+- **Parameters**:
+  - `old_message_id` (string, required) - Message ID of the older version's cover letter or first patch
+  - `new_message_id` (string, required) - Message ID of the newer version's cover letter or first patch
+  - `inbox` (string, optional) - Inbox/list name (required for sourceware-style instances)
+- **Returns**: Subject changes, file differences, and new/removed patches between the two versions
 
 ## How It Works
 
