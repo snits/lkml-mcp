@@ -1,209 +1,191 @@
 # LKML MCP Server
 
-A Model Context Protocol (MCP) server for accessing Linux Kernel Mailing List threads via lore.kernel.org. This server provides tools to fetch complete email threads and raw message content from any kernel mailing list archive (lkml, linux-riscv, netdev, etc.).
+Read the Linux kernel mailing lists from inside your AI assistant — no browser tabs, no `git format-patch` gymnastics, no scrolling through lore.kernel.org's HTML.
+
+Ask *"what did the reviewers say about my RISC-V series?"* or *"grab v3 of this patchset so I can `git am` it"* and get a structured answer back. The server talks to [lore.kernel.org](https://lore.kernel.org) (and any compatible public-inbox archive) and hands your assistant clean, parsed threads instead of raw HTML.
+
+## Why
+
+Following kernel review happens over email, and email tooling is hostile to LLMs: deeply nested quotes, MIME soup, bot noise, threads scattered across dozens of replies. This server does the unglamorous parsing so your assistant can reason about the actual conversation — who reviewed what, which tags landed, what changed between versions.
+
+Works against **any** list on lore.kernel.org without hardcoding names — lkml, netdev, linux-riscv, devicetree, kvm, and the rest — plus per-inbox instances like `inbox.sourceware.org` for GCC/Glibc/GDB.
 
 ## Tools
 
-- **lkml_get_thread**: Fetch a full thread by message ID, returning all messages in the thread with structured metadata (subject, from, date, message-id, in-reply-to, body content). By default, filters out automated bot messages
-- **lkml_get_raw**: Fetch a single message in raw RFC822 format, useful for getting raw MIME bodies, headers, or inline diffs
-- **lkml_get_user_series**: Find recent patch series and messages by user email address. Returns a list of patch series with cover letters and patches grouped together, plus standalone messages
-- **lkml_search_patches**: Search for patches by keywords, subsystem, author, or other criteria. Returns matching patch series and individual patches
-- **lkml_get_patch**: Fetch patches in git am-ready mbox format. Can fetch a single patch or an entire series
-- **lkml_get_thread_summary**: Get a structured summary of a thread: reply hierarchy, participants, and review tags (Reviewed-by, Acked-by, etc.)
-- **lkml_compare_patch_versions**: Compare two versions of a patch series, showing subject changes, file differences, and new/removed patches
-- **Cross-mailing-list support**: Works with any mailing list on lore.kernel.org without hardcoding list names (lkml, linux-riscv, netdev, devicetree, etc.)
+| Tool | Ask it for… | You get back |
+|------|-------------|--------------|
+| `lkml_get_thread` | A full discussion | Every message with subject/from/date/message-id/in-reply-to/body, bot noise filtered out, quoted context preserved |
+| `lkml_get_thread_summary` | The shape of a thread | Reply hierarchy, participant list, and review tags (Reviewed-by, Acked-by, Tested-by…) |
+| `lkml_get_raw` | One message, untouched | Raw RFC822 with all headers, MIME, and inline diffs |
+| `lkml_get_patch` | Something to apply | File paths to clean mbox files ready for `git am` — single patch or whole series |
+| `lkml_search_patches` | Patches matching criteria | Series and individual patches by keyword, subsystem, author, or date |
+| `lkml_get_user_series` | What someone's been posting | Recent series (cover letters + patches grouped) and standalone messages by email |
+| `lkml_compare_patch_versions` | What changed between revisions | Subject changes, file diffs, and added/removed patches across two versions |
 
-## Usage Examples
+> Message IDs work with or without angle brackets — `<id>` and `id` are both fine.
 
-### Fetch a complete thread
-```
-lkml_get_thread with message_id: "20251111105634.1684751-1-lzampier@redhat.com"
-```
+## In practice
 
-### Fetch raw message content
-```
-lkml_get_raw with message_id: "20251111105634.1684751-1-lzampier@redhat.com"
-```
+You don't call these tools directly; you talk to your assistant and it picks the right one. A few things you might say:
 
-Note: Message IDs can be provided with or without angle brackets (e.g., `<message-id>` or `message-id`).
+- *"Pull up the thread for `20251111105634.1684751-1-lzampier@redhat.com` and tell me if anyone objected."*
+- *"Summarize the review tags on this series — did it get enough Reviewed-bys to merge?"*
+- *"Find patches touching the riscv subsystem from the last week."*
+- *"Compare v2 and v3 of this patchset and show me which files changed."*
+- *"Download the whole series as an mbox so I can apply it locally."*
 
-## Tool Reference
+## Installation
 
-### lkml_get_thread
-- **Parameters**:
-  - `message_id` (string) - The message ID to fetch (e.g., '20251111105634.1684751-1-lzampier@redhat.com'). Can be provided with or without angle brackets.
-- **Returns**: All messages in the thread with the following fields for each message:
-  - `subject`: Email subject line
-  - `from`: Sender information
-  - `date`: Message timestamp
-  - `message-id`: Unique message identifier
-  - `in-reply-to`: Parent message ID (if applicable)
-  - `body`: Message content
-
-**Thread Context Preservation**: The tool maintains the full conversation context in two ways:
-
-1. **Thread Structure**: Preserves the `in-reply-to` field linking each reply to its parent message, enabling reconstruction of the discussion tree and tracking of conversation branches.
-
-2. **Quoted Context**: Preserves the complete message body including quoted text (lines starting with `>`) from previous messages. This allows you to see exactly what the user was commenting on by maintaining the quoted lines above their inline responses.
-
-Example thread structure:
-```
-Message A (initial patch)
-├─ Message B (in-reply-to: A) - reviewer comment
-│  └─ Message C (in-reply-to: B) - author response
-└─ Message D (in-reply-to: A) - different reviewer comment
-```
-
-C Example of preserved quoted context in a reply:
-```
-> +    ret = kvm_read_guest(vcpu->kvm, gpa, &data, sizeof(data));
-> +    if (ret < 0)
-> +        return ret;
-
-This looks correct, but you should also handle the case where ret == 0
-since kvm_read_guest() can return 0 for a partial read.
-```
-
-### lkml_get_raw
-- **Parameters**:
-  - `message_id` (string) - The message ID to fetch (e.g., '20251111105634.1684751-1-lzampier@redhat.com'). Can be provided with or without angle brackets.
-- **Returns**: Raw RFC822 formatted message including all headers and MIME content
-
-### lkml_get_patch
-- **Parameters**:
-  - `message_id` (string, required) - Message ID of the patch
-  - `inbox` (string, optional) - Inbox/list name (required for sourceware-style instances)
-  - `series` (boolean, optional, default false) - If true, fetch all patches in the series; if false, fetch only this patch
-  - `include_bots` (boolean, optional, default false) - Include automated bot messages
-- **Returns**: File paths to clean mbox files suitable for `git am`
-
-### lkml_get_thread_summary
-- **Parameters**:
-  - `message_id` (string, required) - Message ID of any message in the thread
-  - `inbox` (string, optional) - Inbox/list name (required for sourceware-style instances)
-  - `include_bots` (boolean, optional, default false) - Include automated bot messages
-- **Returns**: Structured summary with reply hierarchy, participant list, and review tags (Reviewed-by, Acked-by, Tested-by, etc.)
-
-### lkml_compare_patch_versions
-- **Parameters**:
-  - `old_message_id` (string, required) - Message ID of the older version's cover letter or first patch
-  - `new_message_id` (string, required) - Message ID of the newer version's cover letter or first patch
-  - `inbox` (string, optional) - Inbox/list name (required for sourceware-style instances)
-- **Returns**: Subject changes, file differences, and new/removed patches between the two versions
-
-## How It Works
-
-The server fetches data from lore.kernel.org using stable message ID URLs with automatic mailing list detection:
-- Thread data: `https://lore.kernel.org/r/{message-id}/t.mbox.gz` (compressed mbox format)
-  - Uses the `/r/` (redirect) endpoint which automatically detects the correct mailing list
-  - Works with any list: lkml, linux-riscv, netdev, devicetree, and all others hosted on lore.kernel.org
-- Raw messages: `https://lore.kernel.org/r/{message-id}/raw` (RFC822 format)
-
-The `/r/` endpoint redirects to `/all/` which provides cross-list message access without requiring hardcoded mailing list names.
-
-Messages are parsed to extract relevant fields and presented in a structured format for easy consumption by LLM tools.
-
-## Installation by Platform
-
-### Claude Code (CLI)
-
-Add to Claude Code MCP configuration:
+Claude Code, one line:
 
 ```bash
 claude mcp add -s user lkml uvx -- --from "git+https://github.com/zampierilucas/lkml-mcp" lkml-mcp
 ```
 
-Or manually edit `~/.claude.json`:
+Any other MCP client takes the same `uvx` command — drop this into its config:
+
 ```json
 {
   "mcpServers": {
     "lkml": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/zampierilucas/lkml-mcp",
-        "lkml-mcp"
-      ]
+      "args": ["--from", "git+https://github.com/zampierilucas/lkml-mcp", "lkml-mcp"]
     }
   }
 }
 ```
 
-### Claude Desktop
+<details>
+<summary>Other setups — Claude Desktop, local clone</summary>
 
-Install as a Desktop Extension:
+**Claude Desktop** — download `lkml.mcpb` from this repo (or build it with `mcpb pack . lkml.mcpb`), then Settings → Extensions → drag it in → **Enable**.
 
-1. Download `lkml.mcpb` from this repository or build it: `mcpb pack . lkml.mcpb`
-2. Open Claude Desktop → Settings → Extensions
-3. Drag and drop `lkml.mcpb` into the Extensions window
-4. Click "Enable" to activate the extension
-
-### Cursor IDE
-
-1. Open Cursor Settings (⌘+, on Mac, Ctrl+, on Windows/Linux)
-2. Navigate to **Tools & MCP** → **Add Custom MCP**
-3. Add the server configuration:
-
-```json
-{
-  "lkml": {
-    "command": "uvx",
-    "args": [
-      "--from",
-      "git+https://github.com/zampierilucas/lkml-mcp",
-      "lkml-mcp"
-    ]
-  }
-}
-```
-
-### Local Installation (All Platforms)
-
-Clone and install locally:
+**Local clone** — for hacking on the server itself:
 ```bash
 git clone https://github.com/zampierilucas/lkml-mcp.git
-cd lkml-mcp
-pip install -e .
+cd lkml-mcp && pip install -e .
 ```
+Then point your client at `python -m lkml_mcp.server` instead of the `uvx` command.
+</details>
 
-Then configure in your MCP client:
-```json
-{
-  "mcpServers": {
-    "lkml": {
-      "command": "python",
-      "args": ["-m", "lkml_mcp.server"]
-    }
-  }
-}
-```
+## Tool reference
+
+<details>
+<summary><code>lkml_get_thread</code> — fetch a full thread</summary>
+
+- `message_id` (string, required) — with or without angle brackets
+
+Returns every message in the thread, each with `subject`, `from`, `date`, `message-id`, `in-reply-to`, and `body`.
+
+The tool keeps the conversation reconstructable in two ways:
+
+1. **Thread structure** — the `in-reply-to` field links each reply to its parent, so the discussion tree (and its branches) can be rebuilt:
+   ```
+   Message A (initial patch)
+   ├─ Message B (in-reply-to: A) — reviewer comment
+   │  └─ Message C (in-reply-to: B) — author response
+   └─ Message D (in-reply-to: A) — different reviewer comment
+   ```
+
+2. **Quoted context** — the full body, including quoted `>` lines, is preserved so inline replies stay anchored to what they're responding to:
+   ```
+   > +    ret = kvm_read_guest(vcpu->kvm, gpa, &data, sizeof(data));
+   > +    if (ret < 0)
+   > +        return ret;
+
+   This looks correct, but you should also handle the case where ret == 0
+   since kvm_read_guest() can return 0 for a partial read.
+   ```
+</details>
+
+<details>
+<summary><code>lkml_get_thread_summary</code> — reply tree, participants, tags</summary>
+
+- `message_id` (string, required) — any message in the thread
+- `inbox` (string, optional) — required for sourceware-style instances
+- `include_bots` (boolean, default `false`)
+
+Returns the reply hierarchy, participant list, and review tags (Reviewed-by, Acked-by, Tested-by, etc.).
+</details>
+
+<details>
+<summary><code>lkml_get_raw</code> — one message, raw RFC822</summary>
+
+- `message_id` (string, required) — with or without angle brackets
+
+Returns the raw RFC822 message including all headers and MIME content.
+</details>
+
+<details>
+<summary><code>lkml_get_patch</code> — git am-ready mbox</summary>
+
+- `message_id` (string, required)
+- `inbox` (string, optional) — required for sourceware-style instances
+- `series` (boolean, default `false`) — `true` fetches every patch in the series
+- `include_bots` (boolean, default `false`)
+
+Returns file paths to clean mbox files suitable for `git am`.
+</details>
+
+<details>
+<summary><code>lkml_search_patches</code> — search by keyword/subsystem/author</summary>
+
+- `query` (string, required)
+- `inbox` (string, optional) — required for sourceware-style instances
+- `subsystem` (string, optional) — e.g. `net`, `kvm`, `riscv`, `mm`
+- `author` (string, optional) — email or name
+- `since_date` (string, optional) — `YYYYMMDD`
+- `max_results` (integer, default `20`, 1–100)
+</details>
+
+<details>
+<summary><code>lkml_get_user_series</code> — recent series by email</summary>
+
+- `email` (string, required)
+- `inbox` (string, optional) — required for sourceware-style instances
+- `max_results` (integer, default `50`, 1–200)
+
+Returns recent patch series (cover letters and patches grouped) plus standalone messages.
+</details>
+
+<details>
+<summary><code>lkml_compare_patch_versions</code> — diff two revisions</summary>
+
+- `old_message_id` (string, required) — cover letter or first patch of the older version
+- `new_message_id` (string, required) — cover letter or first patch of the newer version
+- `inbox` (string, optional) — required for sourceware-style instances
+
+Returns subject changes, file differences, and new/removed patches between the two versions.
+</details>
+
+## How it works
+
+The server fetches from lore.kernel.org using stable message-ID URLs with automatic list detection:
+
+- **Threads:** `https://lore.kernel.org/r/{message-id}/t.mbox.gz` (compressed mbox)
+- **Raw messages:** `https://lore.kernel.org/r/{message-id}/raw` (RFC822)
+
+The `/r/` (redirect) endpoint forwards to `/all/`, which gives cross-list access without hardcoding mailing-list names — so the same URL works whether the message lives on lkml, linux-riscv, netdev, or anywhere else. Messages are parsed into the structured fields above for easy consumption by LLM tools.
 
 ## Configuration
 
-### BASE_URL
+### Different archive (`LKML_BASE_URL`)
 
-By default, the server connects to `https://lore.kernel.org`. You can configure it to use a different public-inbox archive by setting the `LKML_BASE_URL` environment variable.
+Defaults to `https://lore.kernel.org`. Point it elsewhere by setting `LKML_BASE_URL`:
 
-**Claude Code (CLI)**:
 ```json
 {
   "mcpServers": {
     "lkml": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/zampierilucas/lkml-mcp",
-        "lkml-mcp"
-      ],
-      "env": {
-        "LKML_BASE_URL": "https://custom-lore-instance.org"
-      }
+      "args": ["--from", "git+https://github.com/zampierilucas/lkml-mcp", "lkml-mcp"],
+      "env": { "LKML_BASE_URL": "https://custom-lore-instance.org" }
     }
   }
 }
 ```
 
-**Local Installation**:
+Local:
 ```bash
 export LKML_BASE_URL="https://custom-lore-instance.org"
 python -m lkml_mcp.server
@@ -211,14 +193,13 @@ python -m lkml_mcp.server
 
 ### Transport (stdio / SSE / Streamable HTTP)
 
-The server runs on stdio by default and can also be exposed over HTTP so multiple clients share one process.
+Runs on stdio by default; can also be exposed over HTTP so multiple clients share one process.
 
-CLI flags:
-- `--transport {stdio,sse,streamable-http}` (default `stdio`)
-- `--host` (default `0.0.0.0`)
-- `--port` (default `8772`)
-
-Environment overrides: `LKML_MCP_TRANSPORT`, `LKML_MCP_HOST`, `LKML_MCP_PORT`.
+| Flag | Default | Env override |
+|------|---------|--------------|
+| `--transport {stdio,sse,streamable-http}` | `stdio` | `LKML_MCP_TRANSPORT` |
+| `--host` | `0.0.0.0` | `LKML_MCP_HOST` |
+| `--port` | `8772` | `LKML_MCP_PORT` |
 
 Run as a daemon:
 ```bash
@@ -229,88 +210,47 @@ lkml-mcp --transport sse --host 0.0.0.0 --port 8772
 
 Client endpoints:
 - Streamable HTTP: `http://<host>:8772/mcp`
-- SSE: `http://<host>:8772/sse` (with POSTs to `/messages/`)
+- SSE: `http://<host>:8772/sse` (POSTs to `/messages/`)
 
-Add the running daemon to Claude Code:
+Attach the running daemon to Claude Code:
 ```bash
 claude mcp add -s user -t http lkml http://127.0.0.1:8772/mcp
 # or for SSE:
 claude mcp add -s user -t sse lkml http://127.0.0.1:8772/sse
 ```
 
-### Multi-Instance Setup
+### Multiple archives at once
 
-You can configure multiple MCP server instances to access different public-inbox archives simultaneously. This is useful for accessing both Linux kernel mailing lists (lore.kernel.org) and other projects (like GCC, Glibc on inbox.sourceware.org).
+Run more than one instance to read different archives side by side — say, the kernel lists on lore.kernel.org and GCC/Glibc on inbox.sourceware.org:
 
-**Claude Code (CLI) - Multiple Servers**:
 ```json
 {
   "mcpServers": {
     "lkml": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/zampierilucas/lkml-mcp",
-        "lkml-mcp"
-      ]
+      "args": ["--from", "git+https://github.com/zampierilucas/lkml-mcp", "lkml-mcp"]
     },
     "sourceware": {
       "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/zampierilucas/lkml-mcp",
-        "lkml-mcp"
-      ],
-      "env": {
-        "LKML_BASE_URL": "https://inbox.sourceware.org"
-      }
+      "args": ["--from", "git+https://github.com/zampierilucas/lkml-mcp", "lkml-mcp"],
+      "env": { "LKML_BASE_URL": "https://inbox.sourceware.org" }
     }
   }
 }
 ```
 
-With this setup:
-- Use the `lkml` server for Linux kernel mailing lists (no inbox parameter needed)
-- Use the `sourceware` server for GCC, Glibc, GDB, binutils lists (inbox parameter required)
+- `lkml` → kernel lists (no `inbox` parameter needed)
+- `sourceware` → GCC, Glibc, GDB, binutils (`inbox` parameter **required**)
 
-### Instance Types
+### Instance types
 
-The server automatically detects the public-inbox instance type:
+The server auto-detects which kind of public-inbox instance it's talking to:
 
-**Universal Redirect Instances (like lore.kernel.org)**:
-- Support `/r/` redirect endpoint
-- `inbox` parameter is optional
-- Automatically routes to the correct mailing list
+| | Universal redirect (lore.kernel.org) | Per-inbox (inbox.sourceware.org) |
+|---|---|---|
+| `/r/` redirect endpoint | ✅ | ❌ |
+| `inbox` parameter | optional | **required** |
+| Routing | auto-routes to the right list | you name the inbox |
 
-**Per-Inbox Instances (like inbox.sourceware.org)**:
-- Require explicit inbox names
-- `inbox` parameter is **required** for all operations
-- Common inbox names:
-  - `gcc` - GCC general discussion
-  - `gcc-patches` - GCC patches
-  - `libc-alpha` - Glibc development
-  - `gdb-patches` - GDB patches
-  - `binutils` - Binutils discussion
+Common sourceware inboxes: `gcc`, `gcc-patches`, `libc-alpha`, `gdb-patches`, `binutils`.
 
-## Prerequisites
-
-- Python 3.8+
-- **uvx** - Package runner for Python (install with `pip install uv`)
-- Internet access to `https://lore.kernel.org` (or your configured BASE_URL)
-
-## Development
-
-```bash
-# Install development dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Format code
-black src/
-isort src/
-
-# Type checking
-mypy src/
-```
