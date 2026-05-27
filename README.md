@@ -22,8 +22,6 @@ Works against **any** list on lore.kernel.org without hardcoding names — lkml,
 | `lkml_get_user_series` | What someone's been posting | Recent series (cover letters + patches grouped) and standalone messages by email |
 | `lkml_compare_patch_versions` | What changed between revisions | Subject changes, file diffs, and added/removed patches across two versions |
 
-> Message IDs work with or without angle brackets — `<id>` and `id` are both fine.
-
 ## In practice
 
 You don't call these tools directly; you talk to your assistant and it picks the right one. A few things you might say:
